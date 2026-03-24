@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 import sys
-import heapq
 import traceback
+
 import numpy as np
 import rasterio
 from rasterio.windows import Window
@@ -15,145 +15,97 @@ from PyQt5.QtCore import Qt
 import pyvista as pv
 from pyvistaqt import QtInteractor
 
-
-# =========================
-# Core processing
-# =========================
-
-def ensure_odd(n: int) -> int:
-    n = int(max(3, n))
-    return n if n % 2 == 1 else n + 1
+from algoritma.planner import plan_path
 
 
-def robust_norm_to_uint8(a):
-    arr = a.copy().astype(np.float32)
-    m = np.isfinite(arr)
-    if not m.any():
-        return np.zeros_like(arr, dtype=np.uint8)
-    p2, p98 = np.percentile(arr[m], [2, 98])
+def ensure_odd(value: int) -> int:
+    """Verilen sayıyı en az 3 olacak şekilde tek sayıya çevirir."""
+    value = int(max(3, value))
+    return value if value % 2 == 1 else value + 1
+
+
+def robust_norm_to_uint8(array: np.ndarray) -> np.ndarray:
+    """Yükseklik verisini önizleme için 0-255 aralığına ölçekler."""
+    normalized = array.copy().astype(np.float32)
+    valid_mask = np.isfinite(normalized)
+
+    if not valid_mask.any():
+        return np.zeros_like(normalized, dtype=np.uint8)
+
+    p2, p98 = np.percentile(normalized[valid_mask], [2, 98])
     if p98 <= p2:
         p98 = p2 + 1e-6
-    arr = np.clip((arr - p2) / (p98 - p2), 0, 1)
-    arr[~m] = 0
-    return (arr * 255).astype(np.uint8)
+
+    normalized = np.clip((normalized - p2) / (p98 - p2), 0, 1)
+    normalized[~valid_mask] = 0
+    return (normalized * 255).astype(np.uint8)
 
 
-def fill_nans_iterative(a, iterations=6):
-    out = a.astype(np.float32, copy=True)
-    nanmask = ~np.isfinite(out)
-    if not nanmask.any():
-        return out
-    vals = out[np.isfinite(out)]
-    fallback = np.median(vals) if vals.size else 0.0
-    out[nanmask] = fallback
-    target = nanmask.copy()
+def fill_nans_iterative(array: np.ndarray, iterations: int = 6) -> np.ndarray:
+    """NaN hücreleri komşu değerlerle yaklaşık doldurur."""
+    filled = array.astype(np.float32, copy=True)
+    nan_mask = ~np.isfinite(filled)
+
+    if not nan_mask.any():
+        return filled
+
+    valid_values = filled[np.isfinite(filled)]
+    fallback = np.median(valid_values) if valid_values.size else 0.0
+    filled[nan_mask] = fallback
+
+    target_mask = nan_mask.copy()
     for _ in range(iterations):
-        up = np.roll(out, -1, axis=0)
-        down = np.roll(out, 1, axis=0)
-        left = np.roll(out, -1, axis=1)
-        right = np.roll(out, 1, axis=1)
-        out[target] = 0.25 * (up[target] + down[target] + left[target] + right[target])
-    return out
+        up = np.roll(filled, -1, axis=0)
+        down = np.roll(filled, 1, axis=0)
+        left = np.roll(filled, -1, axis=1)
+        right = np.roll(filled, 1, axis=1)
+        filled[target_mask] = 0.25 * (
+            up[target_mask] + down[target_mask] + left[target_mask] + right[target_mask]
+        )
+
+    return filled
 
 
-def destripe_1d_profiles(z, row_med_win, col_med_win, sigma_row, sigma_col):
-    zz = z.astype(np.float32, copy=True)
+def destripe_1d_profiles(
+    z: np.ndarray,
+    row_med_win: int,
+    col_med_win: int,
+    sigma_row: float,
+    sigma_col: float,
+) -> np.ndarray:
+    """Satır ve sütun profillerindeki bantlaşmayı azaltır."""
+    filtered = z.astype(np.float32, copy=True)
 
-    row_prof = np.median(zz, axis=1)
-    row_win = ensure_odd(min(row_med_win, max(3, (len(row_prof)//2)*2-1)))
-    row_tr = median_filter(row_prof, size=row_win, mode="nearest")
-    row_res = row_prof - row_tr
-    row_low = gaussian_filter(row_res, sigma=sigma_row, mode="nearest")
-    zz -= 0.8 * (row_res - row_low)[:, None]
+    row_profile = np.median(filtered, axis=1)
+    row_window = ensure_odd(min(row_med_win, max(3, (len(row_profile) // 2) * 2 - 1)))
+    row_trend = median_filter(row_profile, size=row_window, mode="nearest")
+    row_residual = row_profile - row_trend
+    row_low = gaussian_filter(row_residual, sigma=sigma_row, mode="nearest")
+    filtered -= 0.8 * (row_residual - row_low)[:, None]
 
-    col_prof = np.median(zz, axis=0)
-    col_win = ensure_odd(min(col_med_win, max(3, (len(col_prof)//2)*2-1)))
-    col_tr = median_filter(col_prof, size=col_win, mode="nearest")
-    col_res = col_prof - col_tr
-    col_low = gaussian_filter(col_res, sigma=sigma_col, mode="nearest")
-    zz -= 0.8 * (col_res - col_low)[None, :]
+    col_profile = np.median(filtered, axis=0)
+    col_window = ensure_odd(min(col_med_win, max(3, (len(col_profile) // 2) * 2 - 1)))
+    col_trend = median_filter(col_profile, size=col_window, mode="nearest")
+    col_residual = col_profile - col_trend
+    col_low = gaussian_filter(col_residual, sigma=sigma_col, mode="nearest")
+    filtered -= 0.8 * (col_residual - col_low)[None, :]
 
-    return zz
-
-
-def final_smooth(z, median_smooth_size, gauss_sigma):
-    zz = median_filter(z, size=median_smooth_size, mode="nearest")
-    zz = gaussian_filter(zz, sigma=gauss_sigma, mode="nearest")
-    return zz.astype(np.float32)
-
-
-def astar_on_grid(z, start_rc, goal_rc, diagonal=True, slope_weight=8.0, uphill_extra=1.5, max_slope=None):
-    H, W = z.shape
-    sr, sc = start_rc
-    gr, gc = goal_rc
-    nbrs = [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)] if diagonal else [(-1,0),(1,0),(0,-1),(0,1)]
-
-    def h(r, c):
-        return np.hypot(gr-r, gc-c)
-
-    g = np.full((H, W), np.inf, dtype=np.float64)
-    pr = np.full((H, W), -1, dtype=np.int32)
-    pc = np.full((H, W), -1, dtype=np.int32)
-    closed = np.zeros((H, W), dtype=bool)
-
-    g[sr, sc] = 0.0
-    pq = [(h(sr, sc), 0.0, sr, sc)]
-
-    while pq:
-        _, gcur, r, c = heapq.heappop(pq)
-        if closed[r, c]:
-            continue
-        closed[r, c] = True
-        if (r, c) == (gr, gc):
-            break
-
-        z0 = z[r, c]
-        for dr, dc in nbrs:
-            rr, cc = r + dr, c + dc
-            if rr < 0 or rr >= H or cc < 0 or cc >= W or closed[rr, cc]:
-                continue
-
-            base_dist = np.hypot(dr, dc)
-            dz = float(z[rr, cc] - z0)
-            slope = abs(dz) / max(base_dist, 1e-6)
-
-            if max_slope is not None and slope > max_slope:
-                continue
-
-            uphill_pen = max(0.0, dz) * uphill_extra
-            step_cost = base_dist + slope_weight * slope + uphill_pen
-            ng = gcur + step_cost
-
-            if ng < g[rr, cc]:
-                g[rr, cc] = ng
-                pr[rr, cc] = r
-                pc[rr, cc] = c
-                heapq.heappush(pq, (ng + h(rr, cc), ng, rr, cc))
-
-    if not np.isfinite(g[gr, gc]):
-        return None, np.inf
-
-    path = []
-    r, c = gr, gc
-    while True:
-        path.append((r, c))
-        if (r, c) == (sr, sc):
-            break
-        rr, cc = pr[r, c], pc[r, c]
-        if rr < 0:
-            return None, np.inf
-        r, c = int(rr), int(cc)
-    path.reverse()
-    return path, g[gr, gc]
+    return filtered
 
 
-# =========================
-# Map selector
-# =========================
+def final_smooth(z: np.ndarray, median_smooth_size: int, gauss_sigma: float) -> np.ndarray:
+    """Son yumuşatma adımını uygular."""
+    smoothed = median_filter(z, size=median_smooth_size, mode="nearest")
+    smoothed = gaussian_filter(smoothed, sigma=gauss_sigma, mode="nearest")
+    return smoothed.astype(np.float32)
+
 
 class MapView(QtWidgets.QGraphicsView):
+    """Önizleme rasterı üzerinde ROI, başlangıç ve hedef seçimi yapar."""
+
     def __init__(self):
         super().__init__()
+
         self.setRenderHint(QtGui.QPainter.Antialiasing, True)
         self.setTransformationAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
         self.setResizeAnchor(QtWidgets.QGraphicsView.AnchorUnderMouse)
@@ -172,16 +124,18 @@ class MapView(QtWidgets.QGraphicsView):
         self.roi_item = None
         self.start_item = None
         self.goal_item = None
+        self.shadow_overlay_item = None
 
         self.dragging = False
         self.drag_start = None
+
         self.img_w = 0
         self.img_h = 0
 
-    def set_mode(self, mode):
+    def set_mode(self, mode: str) -> None:
         self.mode = mode
 
-    def clear_selection(self):
+    def clear_selection(self) -> None:
         self.roi_rect = None
         self.start_pt = None
         self.goal_pt = None
@@ -189,260 +143,425 @@ class MapView(QtWidgets.QGraphicsView):
         self.drag_start = None
 
         if self.roi_item is not None:
-            self.scene_.removeItem(self.roi_item); self.roi_item = None
-        if self.start_item is not None:
-            self.scene_.removeItem(self.start_item); self.start_item = None
-        if self.goal_item is not None:
-            self.scene_.removeItem(self.goal_item); self.goal_item = None
+            self.scene_.removeItem(self.roi_item)
+            self.roi_item = None
 
-    def set_image(self, pixmap):
+        if self.start_item is not None:
+            self.scene_.removeItem(self.start_item)
+            self.start_item = None
+
+        if self.goal_item is not None:
+            self.scene_.removeItem(self.goal_item)
+            self.goal_item = None
+
+        if self.shadow_overlay_item is not None:
+            self.scene_.removeItem(self.shadow_overlay_item)
+            self.shadow_overlay_item = None
+
+    def set_image(self, pixmap: QtGui.QPixmap) -> None:
         self.scene_.clear()
         self.pix_item = self.scene_.addPixmap(pixmap)
         self.scene_.setSceneRect(0, 0, pixmap.width(), pixmap.height())
-        self.img_w, self.img_h = pixmap.width(), pixmap.height()
+
+        self.img_w = pixmap.width()
+        self.img_h = pixmap.height()
+
         self.clear_selection()
         self.resetTransform()
         self.fitInView(self.scene_.sceneRect(), Qt.KeepAspectRatio)
 
-    def wheelEvent(self, e):
-        if self.pix_item is None:
-            return super().wheelEvent(e)
-        f = 1.15 if e.angleDelta().y() > 0 else 1 / 1.15
-        self.scale(f, f)
+    def set_shadow_overlay(self, roi_rect, shadow_map: np.ndarray) -> None:
+        """ROI içine yarı saydam mor shadow overlay çizer."""
+        if self.pix_item is None or roi_rect is None or shadow_map is None:
+            return
 
-    def mousePressEvent(self, e):
-        if self.pix_item is None:
-            return super().mousePressEvent(e)
-        if e.button() != Qt.LeftButton:
-            return super().mousePressEvent(e)
+        if self.shadow_overlay_item is not None:
+            self.scene_.removeItem(self.shadow_overlay_item)
+            self.shadow_overlay_item = None
 
-        p = self.mapToScene(e.pos())
-        x, y = int(p.x()), int(p.y())
+        x0, y0, x1, y1 = roi_rect
+        roi_width = max(1, x1 - x0 + 1)
+        roi_height = max(1, y1 - y0 + 1)
+
+        shadow_mask = (shadow_map > 0).astype(np.uint8)
+
+        rgba = np.zeros((shadow_mask.shape[0], shadow_mask.shape[1], 4), dtype=np.uint8)
+        rgba[..., 0] = 160
+        rgba[..., 1] = 60
+        rgba[..., 2] = 200
+        rgba[..., 3] = shadow_mask * 90
+
+        qimage = QtGui.QImage(
+            rgba.data,
+            rgba.shape[1],
+            rgba.shape[0],
+            4 * rgba.shape[1],
+            QtGui.QImage.Format_RGBA8888,
+        ).copy()
+
+        pixmap = QtGui.QPixmap.fromImage(qimage)
+        pixmap = pixmap.scaled(
+            roi_width,
+            roi_height,
+            Qt.IgnoreAspectRatio,
+            Qt.FastTransformation,
+        )
+
+        self.shadow_overlay_item = self.scene_.addPixmap(pixmap)
+        self.shadow_overlay_item.setPos(x0, y0)
+        self.shadow_overlay_item.setZValue(5)
+
+    def wheelEvent(self, event):
+        if self.pix_item is None:
+            return super().wheelEvent(event)
+
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        self.scale(factor, factor)
+
+    def mousePressEvent(self, event):
+        if self.pix_item is None:
+            return super().mousePressEvent(event)
+
+        if event.button() != Qt.LeftButton:
+            return super().mousePressEvent(event)
+
+        scene_point = self.mapToScene(event.pos())
+        x, y = int(scene_point.x()), int(scene_point.y())
+
         if not (0 <= x < self.img_w and 0 <= y < self.img_h):
             return
 
         if self.mode == "roi":
             self.dragging = True
             self.drag_start = (x, y)
+
             if self.roi_item is None:
-                self.roi_item = self.scene_.addRect(x, y, 1, 1, QtGui.QPen(QtGui.QColor(255, 0, 0), 2))
+                self.roi_item = self.scene_.addRect(
+                    x, y, 1, 1,
+                    QtGui.QPen(QtGui.QColor(255, 0, 0), 2),
+                )
             else:
                 self.roi_item.setRect(x, y, 1, 1)
 
         elif self.mode == "start":
             if self.roi_rect is None:
                 return
+
             x0, y0, x1, y1 = self.roi_rect
             if not (x0 <= x <= x1 and y0 <= y <= y1):
                 return
+
             self.start_pt = (x, y)
+
             if self.start_item is not None:
                 self.scene_.removeItem(self.start_item)
+
             self.start_item = self.scene_.addEllipse(
                 x - 4, y - 4, 8, 8,
                 QtGui.QPen(QtGui.QColor(0, 255, 0), 2),
-                QtGui.QBrush(QtGui.QColor(0, 255, 0))
+                QtGui.QBrush(QtGui.QColor(0, 255, 0)),
             )
 
         elif self.mode == "goal":
             if self.roi_rect is None:
                 return
+
             x0, y0, x1, y1 = self.roi_rect
             if not (x0 <= x <= x1 and y0 <= y <= y1):
                 return
+
             self.goal_pt = (x, y)
+
             if self.goal_item is not None:
                 self.scene_.removeItem(self.goal_item)
+
             self.goal_item = self.scene_.addEllipse(
                 x - 4, y - 4, 8, 8,
                 QtGui.QPen(QtGui.QColor(0, 0, 255), 2),
-                QtGui.QBrush(QtGui.QColor(0, 0, 255))
+                QtGui.QBrush(QtGui.QColor(0, 0, 255)),
             )
 
-    def mouseMoveEvent(self, e):
+    def mouseMoveEvent(self, event):
         if self.pix_item is None:
-            return super().mouseMoveEvent(e)
+            return super().mouseMoveEvent(event)
+
         if self.dragging and self.mode == "roi" and self.drag_start is not None:
-            p = self.mapToScene(e.pos())
-            x = int(np.clip(int(p.x()), 0, self.img_w - 1))
-            y = int(np.clip(int(p.y()), 0, self.img_h - 1))
+            scene_point = self.mapToScene(event.pos())
+            x = int(np.clip(int(scene_point.x()), 0, self.img_w - 1))
+            y = int(np.clip(int(scene_point.y()), 0, self.img_h - 1))
+
             x0, y0 = self.drag_start
             rx0, ry0 = min(x0, x), min(y0, y)
             rx1, ry1 = max(x0, x), max(y0, y)
+
             self.roi_rect = (rx0, ry0, rx1, ry1)
+
             if self.roi_item is not None:
                 self.roi_item.setRect(rx0, ry0, max(1, rx1 - rx0), max(1, ry1 - ry0))
             return
-        super().mouseMoveEvent(e)
 
-    def mouseReleaseEvent(self, e):
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
         if self.pix_item is None:
-            return super().mouseReleaseEvent(e)
-        if e.button() == Qt.LeftButton and self.dragging and self.mode == "roi":
+            return super().mouseReleaseEvent(event)
+
+        if event.button() == Qt.LeftButton and self.dragging and self.mode == "roi":
             self.dragging = False
+
             if self.roi_item is not None:
-                r = self.roi_item.rect()
-                x0, y0, x1, y1 = int(r.left()), int(r.top()), int(r.right()), int(r.bottom())
-                x0 = int(np.clip(x0, 0, self.img_w - 1)); x1 = int(np.clip(x1, 0, self.img_w - 1))
-                y0 = int(np.clip(y0, 0, self.img_h - 1)); y1 = int(np.clip(y1, 0, self.img_h - 1))
+                rect = self.roi_item.rect()
+
+                x0 = int(np.clip(int(rect.left()), 0, self.img_w - 1))
+                x1 = int(np.clip(int(rect.right()), 0, self.img_w - 1))
+                y0 = int(np.clip(int(rect.top()), 0, self.img_h - 1))
+                y1 = int(np.clip(int(rect.bottom()), 0, self.img_h - 1))
+
                 if x1 > x0 and y1 > y0:
                     self.roi_rect = (x0, y0, x1, y1)
             return
-        super().mouseReleaseEvent(e)
 
+        super().mouseReleaseEvent(event)
 
-# =========================
-# Worker thread
-# =========================
 
 class ComputeWorker(QtCore.QObject):
+    """Raster okuma, preprocess ve rota hesabını arka planda yapar."""
+
     progress = QtCore.pyqtSignal(str)
     finished = QtCore.pyqtSignal(dict)
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, payload):
+    def __init__(self, payload: dict):
         super().__init__()
         self.payload = payload
 
     @QtCore.pyqtSlot()
     def run(self):
         try:
-            p = self.payload
+            params = self.payload
             self.progress.emit("Raster okunuyor...")
 
-            with rasterio.open(p["geotiff_path"]) as src:
-                ph, pw = p["preview_shape"]
-                fx = src.width / pw
-                fy = src.height / ph
+            with rasterio.open(params["geotiff_path"]) as src:
+                preview_height, preview_width = params["preview_shape"]
 
-                x0p, y0p, x1p, y1p = p["roi_rect"]
-                x0 = int(np.floor(x0p * fx)); x1 = int(np.ceil((x1p + 1) * fx))
-                y0 = int(np.floor(y0p * fy)); y1 = int(np.ceil((y1p + 1) * fy))
-                x0 = int(np.clip(x0, 0, src.width - 1)); x1 = int(np.clip(x1, x0 + 1, src.width))
-                y0 = int(np.clip(y0, 0, src.height - 1)); y1 = int(np.clip(y1, y0 + 1, src.height))
+                scale_x = src.width / preview_width
+                scale_y = src.height / preview_height
 
-                sxp, syp = p["start_pt"]
-                gxp, gyp = p["goal_pt"]
+                x0p, y0p, x1p, y1p = params["roi_rect"]
+                x0 = int(np.floor(x0p * scale_x))
+                x1 = int(np.ceil((x1p + 1) * scale_x))
+                y0 = int(np.floor(y0p * scale_y))
+                y1 = int(np.ceil((y1p + 1) * scale_y))
 
-                sc_full = int(np.clip(round(sxp * fx), x0, x1 - 1))
-                sr_full = int(np.clip(round(syp * fy), y0, y1 - 1))
-                gc_full = int(np.clip(round(gxp * fx), x0, x1 - 1))
-                gr_full = int(np.clip(round(gyp * fy), y0, y1 - 1))
+                x0 = int(np.clip(x0, 0, src.width - 1))
+                x1 = int(np.clip(x1, x0 + 1, src.width))
+                y0 = int(np.clip(y0, 0, src.height - 1))
+                y1 = int(np.clip(y1, y0 + 1, src.height))
 
-                ds = max(1, int(p["downsample"]))
-                out_h = max(2, int((y1 - y0) / ds))
-                out_w = max(2, int((x1 - x0) / ds))
+                start_x_preview, start_y_preview = params["start_pt"]
+                goal_x_preview, goal_y_preview = params["goal_pt"]
 
-                win = Window(x0, y0, x1 - x0, y1 - y0)
-                z = src.read(1, window=win, out_shape=(out_h, out_w),
-                             resampling=rasterio.enums.Resampling.bilinear).astype(np.float32)
+                start_col_full = int(np.clip(round(start_x_preview * scale_x), x0, x1 - 1))
+                start_row_full = int(np.clip(round(start_y_preview * scale_y), y0, y1 - 1))
+                goal_col_full = int(np.clip(round(goal_x_preview * scale_x), x0, x1 - 1))
+                goal_row_full = int(np.clip(round(goal_y_preview * scale_y), y0, y1 - 1))
+
+                downsample = max(1, int(params["downsample"]))
+                out_height = max(2, int((y1 - y0) / downsample))
+                out_width = max(2, int((x1 - x0) / downsample))
+
+                window = Window(x0, y0, x1 - x0, y1 - y0)
+                z = src.read(
+                    1,
+                    window=window,
+                    out_shape=(out_height, out_width),
+                    resampling=rasterio.enums.Resampling.bilinear,
+                ).astype(np.float32)
+
                 if src.nodata is not None:
                     z[np.isclose(z, src.nodata)] = np.nan
 
             self.progress.emit("Preprocess...")
-            z = fill_nans_iterative(z, iterations=int(p["fill_iter"]))
+
+            z = fill_nans_iterative(z, iterations=int(params["fill_iter"]))
             z = destripe_1d_profiles(
-                z,
-                row_med_win=ensure_odd(int(p["row_med_win"])),
-                col_med_win=ensure_odd(int(p["col_med_win"])),
-                sigma_row=float(p["sigma_row"]),
-                sigma_col=float(p["sigma_col"])
+                z=z,
+                row_med_win=ensure_odd(int(params["row_med_win"])),
+                col_med_win=ensure_odd(int(params["col_med_win"])),
+                sigma_row=float(params["sigma_row"]),
+                sigma_col=float(params["sigma_col"]),
             )
             z = final_smooth(
-                z,
-                median_smooth_size=ensure_odd(int(p["median_smooth"])),
-                gauss_sigma=float(p["gauss_sigma"])
+                z=z,
+                median_smooth_size=ensure_odd(int(params["median_smooth"])),
+                gauss_sigma=float(params["gauss_sigma"]),
             )
 
-            sr = int(np.clip(round((sr_full - y0) / ds), 0, z.shape[0] - 1))
-            sc = int(np.clip(round((sc_full - x0) / ds), 0, z.shape[1] - 1))
-            gr = int(np.clip(round((gr_full - y0) / ds), 0, z.shape[0] - 1))
-            gc = int(np.clip(round((gc_full - x0) / ds), 0, z.shape[1] - 1))
+            start_row = int(np.clip(round((start_row_full - y0) / downsample), 0, z.shape[0] - 1))
+            start_col = int(np.clip(round((start_col_full - x0) / downsample), 0, z.shape[1] - 1))
+            goal_row = int(np.clip(round((goal_row_full - y0) / downsample), 0, z.shape[0] - 1))
+            goal_col = int(np.clip(round((goal_col_full - x0) / downsample), 0, z.shape[1] - 1))
 
             self.progress.emit("A* çalışıyor...")
-            path, cost = astar_on_grid(
-                z, (sr, sc), (gr, gc),
-                diagonal=bool(p["diagonal"]),
-                slope_weight=float(p["slope_weight"]),
-                uphill_extra=float(p["uphill_extra"]),
-                max_slope=p["max_slope"]
+
+            shadow_map = np.zeros_like(z, dtype=np.float32)
+
+            # Test için basit gölge bölgesi:
+            # ROI'nin sağ tarafında dikey bir bant gölgeli kabul ediliyor.
+            height, width = z.shape
+            shadow_start_col = int(width * 0.55)
+            shadow_end_col = int(width * 0.75)
+            shadow_map[:, shadow_start_col:shadow_end_col] = 1.0
+
+            path, cost = plan_path(
+                z=z,
+                start_rc=(start_row, start_col),
+                goal_rc=(goal_row, goal_col),
+                diagonal=bool(params["diagonal"]),
+                slope_weight=float(params["slope_weight"]),
+                uphill_extra=float(params["uphill_extra"]),
+                max_slope=params["max_slope"],
+                shadow_map=shadow_map,
+                shadow_weight=float(params["shadow_weight"]),
+                crater_weight=float(params["crater_weight"]),
             )
+
             if path is None:
                 raise RuntimeError("Yol bulunamadı.")
 
-            self.finished.emit({
-                "z": z, "path": path, "cost": float(cost),
-                "sr": sr, "sc": sc, "gr": gr, "gc": gc
-            })
+            self.finished.emit(
+                {
+                    "z": z,
+                    "path": path,
+                    "cost": float(cost),
+                    "sr": start_row,
+                    "sc": start_col,
+                    "gr": goal_row,
+                    "gc": goal_col,
+                    "shadow_map": shadow_map,
+                    "roi_rect": params["roi_rect"],
+                }
+            )
 
-        except Exception as e:
-            self.failed.emit(f"{e}\n\n{traceback.format_exc()}")
+        except Exception as exc:
+            self.failed.emit(f"{exc}\n\n{traceback.format_exc()}")
 
-
-# =========================
-# Main GUI
-# =========================
 
 class MainWindow(QtWidgets.QMainWindow):
+    """Uygulamanın ana arayüzü."""
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("DTM A* GUI - Shadow Enhanced")
+
+        self.setWindowTitle("DTM A* GUI - Refactored")
         self.resize(1650, 950)
 
         self.geotiff_path = None
         self.preview = None
+
         self.worker_thread = None
         self.worker = None
 
         self._build_ui()
 
     def _build_ui(self):
-        w = QtWidgets.QWidget()
-        self.setCentralWidget(w)
-        root = QtWidgets.QHBoxLayout(w)
+        container = QtWidgets.QWidget()
+        self.setCentralWidget(container)
 
-        left = QtWidgets.QVBoxLayout()
-        root.addLayout(left, stretch=3)
+        root_layout = QtWidgets.QHBoxLayout(container)
 
-        row_file = QtWidgets.QHBoxLayout()
+        left_layout = QtWidgets.QVBoxLayout()
+        root_layout.addLayout(left_layout, stretch=3)
+
+        file_row = QtWidgets.QHBoxLayout()
         self.path_edit = QtWidgets.QLineEdit()
-        btn_browse = QtWidgets.QPushButton("GeoTIFF Seç")
-        btn_browse.clicked.connect(self.load_geotiff)
-        row_file.addWidget(self.path_edit)
-        row_file.addWidget(btn_browse)
-        left.addLayout(row_file)
 
-        row_mode = QtWidgets.QHBoxLayout()
-        btn_roi = QtWidgets.QPushButton("ROI")
-        btn_start = QtWidgets.QPushButton("START")
-        btn_goal = QtWidgets.QPushButton("GOAL")
-        btn_roi.clicked.connect(lambda: self.map_view.set_mode("roi"))
-        btn_start.clicked.connect(lambda: self.map_view.set_mode("start"))
-        btn_goal.clicked.connect(lambda: self.map_view.set_mode("goal"))
-        row_mode.addWidget(btn_roi); row_mode.addWidget(btn_start); row_mode.addWidget(btn_goal)
-        left.addLayout(row_mode)
+        browse_button = QtWidgets.QPushButton("GeoTIFF Seç")
+        browse_button.clicked.connect(self.load_geotiff)
+
+        file_row.addWidget(self.path_edit)
+        file_row.addWidget(browse_button)
+        left_layout.addLayout(file_row)
+
+        mode_row = QtWidgets.QHBoxLayout()
+
+        roi_button = QtWidgets.QPushButton("ROI")
+        start_button = QtWidgets.QPushButton("START")
+        goal_button = QtWidgets.QPushButton("GOAL")
+
+        roi_button.clicked.connect(lambda: self.map_view.set_mode("roi"))
+        start_button.clicked.connect(lambda: self.map_view.set_mode("start"))
+        goal_button.clicked.connect(lambda: self.map_view.set_mode("goal"))
+
+        mode_row.addWidget(roi_button)
+        mode_row.addWidget(start_button)
+        mode_row.addWidget(goal_button)
+        left_layout.addLayout(mode_row)
 
         self.map_view = MapView()
-        left.addWidget(self.map_view)
+        left_layout.addWidget(self.map_view)
 
-        right = QtWidgets.QVBoxLayout()
-        root.addLayout(right, stretch=2)
+        right_layout = QtWidgets.QVBoxLayout()
+        root_layout.addLayout(right_layout, stretch=2)
 
         form = QtWidgets.QFormLayout()
-        self.ds = QtWidgets.QSpinBox(); self.ds.setRange(1, 64); self.ds.setValue(1)
-        self.fill_iter = QtWidgets.QSpinBox(); self.fill_iter.setRange(1, 100); self.fill_iter.setValue(8)
-        self.row_win = QtWidgets.QSpinBox(); self.row_win.setRange(3, 9999); self.row_win.setValue(101)
-        self.col_win = QtWidgets.QSpinBox(); self.col_win.setRange(3, 9999); self.col_win.setValue(101)
-        self.sig_row = QtWidgets.QDoubleSpinBox(); self.sig_row.setRange(0.1, 1000); self.sig_row.setValue(25.0)
-        self.sig_col = QtWidgets.QDoubleSpinBox(); self.sig_col.setRange(0.1, 1000); self.sig_col.setValue(25.0)
-        self.med = QtWidgets.QSpinBox(); self.med.setRange(1, 99); self.med.setValue(3)
-        self.gau = QtWidgets.QDoubleSpinBox(); self.gau.setRange(0.1, 100); self.gau.setValue(1.2)
 
-        self.diag = QtWidgets.QCheckBox(); self.diag.setChecked(True)
-        self.sw = QtWidgets.QDoubleSpinBox(); self.sw.setRange(0, 1000); self.sw.setValue(8.0)
-        self.ue = QtWidgets.QDoubleSpinBox(); self.ue.setRange(0, 1000); self.ue.setValue(1.5)
+        self.ds = QtWidgets.QSpinBox()
+        self.ds.setRange(1, 64)
+        self.ds.setValue(1)
+
+        self.fill_iter = QtWidgets.QSpinBox()
+        self.fill_iter.setRange(1, 100)
+        self.fill_iter.setValue(8)
+
+        self.row_win = QtWidgets.QSpinBox()
+        self.row_win.setRange(3, 9999)
+        self.row_win.setValue(101)
+
+        self.col_win = QtWidgets.QSpinBox()
+        self.col_win.setRange(3, 9999)
+        self.col_win.setValue(101)
+
+        self.sig_row = QtWidgets.QDoubleSpinBox()
+        self.sig_row.setRange(0.1, 1000)
+        self.sig_row.setValue(25.0)
+
+        self.sig_col = QtWidgets.QDoubleSpinBox()
+        self.sig_col.setRange(0.1, 1000)
+        self.sig_col.setValue(25.0)
+
+        self.med = QtWidgets.QSpinBox()
+        self.med.setRange(1, 99)
+        self.med.setValue(3)
+
+        self.gau = QtWidgets.QDoubleSpinBox()
+        self.gau.setRange(0.1, 100)
+        self.gau.setValue(1.2)
+
+        self.diag = QtWidgets.QCheckBox()
+        self.diag.setChecked(True)
+
+        self.sw = QtWidgets.QDoubleSpinBox()
+        self.sw.setRange(0, 1000)
+        self.sw.setValue(8.0)
+
+        self.ue = QtWidgets.QDoubleSpinBox()
+        self.ue.setRange(0, 1000)
+        self.ue.setValue(1.5)
+
+        self.shadow_weight = QtWidgets.QDoubleSpinBox()
+        self.shadow_weight.setRange(0, 1000)
+        self.shadow_weight.setValue(10.0)
+
+        self.crater_weight = QtWidgets.QDoubleSpinBox()
+        self.crater_weight.setRange(0, 1000)
+        self.crater_weight.setValue(0.0)
+
         self.use_ms = QtWidgets.QCheckBox()
-        self.ms = QtWidgets.QDoubleSpinBox(); self.ms.setRange(0.001, 1000); self.ms.setValue(1.0)
+
+        self.ms = QtWidgets.QDoubleSpinBox()
+        self.ms.setRange(0.001, 1000)
+        self.ms.setValue(1.0)
 
         form.addRow("Downsample", self.ds)
         form.addRow("Fill Iter", self.fill_iter)
@@ -455,67 +574,95 @@ class MainWindow(QtWidgets.QMainWindow):
         form.addRow("Diagonal", self.diag)
         form.addRow("Slope Weight", self.sw)
         form.addRow("Uphill Extra", self.ue)
+        form.addRow("Shadow Weight", self.shadow_weight)
+        form.addRow("Crater Weight", self.crater_weight)
         form.addRow("Use Max Slope", self.use_ms)
         form.addRow("Max Slope", self.ms)
-        right.addLayout(form)
+
+        right_layout.addLayout(form)
 
         self.btn_run = QtWidgets.QPushButton("Path Hesapla + 3D Göster")
         self.btn_run.clicked.connect(self.start_compute)
-        btn_clear = QtWidgets.QPushButton("Seçimleri Temizle")
-        btn_clear.clicked.connect(self.map_view.clear_selection)
-        right.addWidget(self.btn_run)
-        right.addWidget(btn_clear)
+
+        clear_button = QtWidgets.QPushButton("Seçimleri Temizle")
+        clear_button.clicked.connect(self.map_view.clear_selection)
+
+        right_layout.addWidget(self.btn_run)
+        right_layout.addWidget(clear_button)
 
         self.status = QtWidgets.QLabel("Hazır")
         self.status.setWordWrap(True)
-        right.addWidget(self.status)
+        right_layout.addWidget(self.status)
 
         self.plotter = QtInteractor(self)
-        right.addWidget(self.plotter.interactor, stretch=1)
+        right_layout.addWidget(self.plotter.interactor, stretch=1)
 
     def load_geotiff(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "GeoTIFF seç", "", "GeoTIFF (*.tif *.tiff);;All files (*)"
+            self,
+            "GeoTIFF seç",
+            "",
+            "GeoTIFF (*.tif *.tiff);;All files (*)",
         )
+
         if not path:
             return
+
         self.geotiff_path = path
         self.path_edit.setText(path)
 
         with rasterio.open(path) as src:
             max_preview = 1600
             scale = max(src.width / max_preview, src.height / max_preview, 1.0)
-            p_w = int(src.width / scale)
-            p_h = int(src.height / scale)
 
-            arr = src.read(1, out_shape=(p_h, p_w), resampling=rasterio.enums.Resampling.bilinear).astype(np.float32)
+            preview_width = int(src.width / scale)
+            preview_height = int(src.height / scale)
+
+            preview = src.read(
+                1,
+                out_shape=(preview_height, preview_width),
+                resampling=rasterio.enums.Resampling.bilinear,
+            ).astype(np.float32)
+
             if src.nodata is not None:
-                arr[np.isclose(arr, src.nodata)] = np.nan
+                preview[np.isclose(preview, src.nodata)] = np.nan
 
-        self.preview = arr
-        img = robust_norm_to_uint8(arr)
-        rgb = np.stack([img, img, img], axis=-1).copy()
-        qimg = QtGui.QImage(rgb.data, rgb.shape[1], rgb.shape[0], 3 * rgb.shape[1], QtGui.QImage.Format_RGB888).copy()
-        self.map_view.set_image(QtGui.QPixmap.fromImage(qimg))
+        self.preview = preview
+
+        image_u8 = robust_norm_to_uint8(preview)
+        rgb = np.stack([image_u8, image_u8, image_u8], axis=-1).copy()
+
+        qimage = QtGui.QImage(
+            rgb.data,
+            rgb.shape[1],
+            rgb.shape[0],
+            3 * rgb.shape[1],
+            QtGui.QImage.Format_RGB888,
+        ).copy()
+
+        self.map_view.set_image(QtGui.QPixmap.fromImage(qimage))
         self.status.setText("Raster yüklendi. ROI -> START -> GOAL seç.")
 
     def start_compute(self):
         if self.geotiff_path is None or self.preview is None:
             self.status.setText("Önce dosya seç.")
             return
+
         if self.map_view.roi_rect is None:
             self.status.setText("Önce ROI seç.")
             return
+
         if self.map_view.start_pt is None or self.map_view.goal_pt is None:
             self.status.setText("START ve GOAL seç.")
             return
+
         if self.worker_thread is not None:
             self.status.setText("İşlem sürüyor...")
             return
 
         payload = {
             "geotiff_path": self.geotiff_path,
-            "preview_shape": self.preview.shape,  # (h,w)
+            "preview_shape": self.preview.shape,
             "roi_rect": self.map_view.roi_rect,
             "start_pt": self.map_view.start_pt,
             "goal_pt": self.map_view.goal_pt,
@@ -530,78 +677,91 @@ class MainWindow(QtWidgets.QMainWindow):
             "diagonal": bool(self.diag.isChecked()),
             "slope_weight": float(self.sw.value()),
             "uphill_extra": float(self.ue.value()),
-            "max_slope": float(self.ms.value()) if self.use_ms.isChecked() else None
+            "shadow_weight": float(self.shadow_weight.value()),
+            "crater_weight": float(self.crater_weight.value()),
+            "max_slope": float(self.ms.value()) if self.use_ms.isChecked() else None,
         }
 
         self.btn_run.setEnabled(False)
+
         self.worker_thread = QtCore.QThread()
         self.worker = ComputeWorker(payload)
         self.worker.moveToThread(self.worker_thread)
 
         self.worker_thread.started.connect(self.worker.run)
-        self.worker.progress.connect(lambda m: self.status.setText(m))
+        self.worker.progress.connect(lambda message: self.status.setText(message))
         self.worker.finished.connect(self.on_finished)
         self.worker.failed.connect(self.on_failed)
 
         self.worker.finished.connect(self.worker_thread.quit)
         self.worker.failed.connect(self.worker_thread.quit)
         self.worker_thread.finished.connect(self.cleanup_worker)
+
         self.worker_thread.start()
 
-    def on_finished(self, result):
+    def on_finished(self, result: dict):
         try:
             z = result["z"]
             path = result["path"]
             cost = result["cost"]
-            sr, sc, gr, gc = result["sr"], result["sc"], result["gr"], result["gc"]
+            shadow_map = result.get("shadow_map")
+            roi_rect = result.get("roi_rect")
 
-            # normalize for visibility
-            zv = z.astype(np.float32)
-            zv = np.nan_to_num(zv, nan=np.nanmedian(zv))
-            zv = zv - np.nanmin(zv)
-            zstd = float(np.nanstd(zv))
-            if zstd < 1e-6:
-                zstd = 1.0
-            zv = zv / zstd
+            start_row = result["sr"]
+            start_col = result["sc"]
+            goal_row = result["gr"]
+            goal_col = result["gc"]
 
-            H, W = zv.shape
-            yy, xx = np.mgrid[0:H, 0:W]
+            z_vis = z.astype(np.float32)
+            z_vis = np.nan_to_num(z_vis, nan=np.nanmedian(z_vis))
+            z_vis = z_vis - np.nanmin(z_vis)
+
+            z_std = float(np.nanstd(z_vis))
+            if z_std < 1e-6:
+                z_std = 1.0
+
+            z_vis = z_vis / z_std
+
+            height, width = z_vis.shape
+            yy, xx = np.mgrid[0:height, 0:width]
+
             grid = pv.StructuredGrid(
                 xx.astype(np.float32),
                 yy.astype(np.float32),
-                np.zeros_like(xx, dtype=np.float32)
+                np.zeros_like(xx, dtype=np.float32),
             )
-            grid.point_data["elevation"] = zv.ravel(order="F")
+            grid.point_data["elevation"] = z_vis.ravel(order="F")
             grid.set_active_scalars("elevation")
 
             warp_factor = 50.0
             warped = grid.warp_by_scalar("elevation", factor=warp_factor)
 
-            pts = np.zeros((len(path), 3), dtype=np.float32)
-            for i, (r, c) in enumerate(path):
-                pts[i] = (c, r, zv[r, c] * warp_factor + 1.2)
-            line = pv.lines_from_points(pts, close=False)
+            path_points = np.zeros((len(path), 3), dtype=np.float32)
+            for index, (row, col) in enumerate(path):
+                path_points[index] = (col, row, z_vis[row, col] * warp_factor + 1.2)
+
+            line = pv.lines_from_points(path_points, close=False)
 
             self.plotter.clear()
             self.plotter.set_background("#dcdcdc")
             self.plotter.enable_trackball_style()
-
-            # --- Lighting for crater shadows ---
             self.plotter.remove_all_lights()
-            light1 = pv.Light(
-                position=(W * 0.2, H * 0.2, 3000),
-                focal_point=(W / 2, H / 2, 0),
-                color='white',
-                intensity=0.9
+
+            key_light = pv.Light(
+                position=(width * 0.2, height * 0.2, 3000),
+                focal_point=(width / 2, height / 2, 0),
+                color="white",
+                intensity=0.9,
             )
-            light2 = pv.Light(
-                position=(W * 0.8, H * 0.9, 2000),
-                focal_point=(W / 2, H / 2, 0),
-                color='white',
-                intensity=0.45
+            fill_light = pv.Light(
+                position=(width * 0.8, height * 0.9, 2000),
+                focal_point=(width / 2, height / 2, 0),
+                color="white",
+                intensity=0.45,
             )
-            self.plotter.add_light(light1)
-            self.plotter.add_light(light2)
+
+            self.plotter.add_light(key_light)
+            self.plotter.add_light(fill_light)
 
             self.plotter.add_mesh(
                 warped,
@@ -611,43 +771,67 @@ class MainWindow(QtWidgets.QMainWindow):
                 specular=0.18,
                 diffuse=0.88,
                 ambient=0.08,
-                scalars=None
+                scalars=None,
             )
 
-            self.plotter.add_mesh(line, color="#e10000", line_width=6, render_lines_as_tubes=True)
-            self.plotter.add_points(
-                np.array([[sc, sr, zv[sr, sc] * warp_factor + 1.8]], dtype=np.float32),
-                color="#00aa00", point_size=15, render_points_as_spheres=True
+            self.plotter.add_mesh(
+                line,
+                color="#e10000",
+                line_width=6,
+                render_lines_as_tubes=True,
             )
+
             self.plotter.add_points(
-                np.array([[gc, gr, zv[gr, gc] * warp_factor + 1.8]], dtype=np.float32),
-                color="#0060ff", point_size=15, render_points_as_spheres=True
+                np.array([[start_col, start_row, z_vis[start_row, start_col] * warp_factor + 1.8]], dtype=np.float32),
+                color="#00aa00",
+                point_size=15,
+                render_points_as_spheres=True,
+            )
+
+            self.plotter.add_points(
+                np.array([[goal_col, goal_row, z_vis[goal_row, goal_col] * warp_factor + 1.8]], dtype=np.float32),
+                color="#0060ff",
+                point_size=15,
+                render_points_as_spheres=True,
             )
 
             self.plotter.add_text(
                 "Mouse: Sol=Rotate  Orta=Pan  Teker=Zoom  R=Reset Camera",
-                position="upper_left", font_size=11, color="black"
+                position="upper_left",
+                font_size=11,
+                color="black",
             )
-            self.plotter.add_text(f"A* cost = {cost:.2f}", position="upper_right", font_size=12, color="black")
+            self.plotter.add_text(
+                f"A* cost = {cost:.2f}",
+                position="upper_right",
+                font_size=12,
+                color="black",
+            )
+
             self.plotter.add_axes(line_width=2)
             self.plotter.show_grid(color="#bdbdbd")
             self.plotter.camera_position = "iso"
             self.plotter.reset_camera()
             self.plotter.render()
 
+            if shadow_map is not None and roi_rect is not None:
+                self.map_view.set_shadow_overlay(roi_rect, shadow_map)
+
             self.status.setText(f"Tamamlandı. node={len(path)} cost={cost:.3f}")
 
-        except Exception as e:
-            self.status.setText(f"Render hatası: {e}")
+        except Exception as exc:
+            self.status.setText(f"Render hatası: {exc}")
 
-    def on_failed(self, err):
-        self.status.setText(f"Hata:\n{err}")
+    def on_failed(self, error_text: str):
+        self.status.setText(f"Hata:\n{error_text}")
 
     def cleanup_worker(self):
         self.btn_run.setEnabled(True)
+
         if self.worker is not None:
             self.worker.deleteLater()
             self.worker = None
+
         if self.worker_thread is not None:
             self.worker_thread.deleteLater()
             self.worker_thread = None
@@ -655,8 +839,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
-    w = MainWindow()
-    w.show()
+    window = MainWindow()
+    window.show()
     sys.exit(app.exec_())
 
 
